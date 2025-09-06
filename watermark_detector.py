@@ -159,3 +159,177 @@ class WatermarkDetector:
 
         except Exception as e:
             return [], f"Error searching for elements: {str(e)}"
+
+
+# ------------------------------
+# PPTX watermark/link detector
+# ------------------------------
+
+try:
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+except Exception:
+    Presentation = None
+    MSO_SHAPE_TYPE = None
+
+
+def _pptx_slide_size(slide):
+    try:
+        prs = slide.part.package.presentation
+        return float(prs.slide_width), float(prs.slide_height)
+    except Exception:
+        return 0.0, 0.0
+
+
+def _pptx_is_in_corner(shape, right_edge, bottom_edge):
+    try:
+        left = float(shape.left)
+        top = float(shape.top)
+        return (left >= right_edge) and (top >= bottom_edge)
+    except Exception:
+        return False
+
+
+def _pptx_shape_hyperlink_url(shape):
+    """Return the first hyperlink URL found on a shape (click_action) or None."""
+    try:
+        if hasattr(shape, "click_action") and shape.click_action is not None:
+            h = shape.click_action.hyperlink
+            if h is not None and getattr(h, 'address', None):
+                return (h.address or '').strip()
+    except Exception:
+        pass
+    return None
+
+
+def _pptx_iter_text_run_links(shape):
+    """Yield (paragraph_index, run_index, url) for any text run hyperlinks on a shape."""
+    if not hasattr(shape, "text_frame") or shape.text_frame is None:
+        return
+    try:
+        for pi, p in enumerate(shape.text_frame.paragraphs):
+            for ri, r in enumerate(p.runs):
+                try:
+                    if r.hyperlink and r.hyperlink.address:
+                        yield (pi, ri, r.hyperlink.address)
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
+class PPTXWatermarkDetector:
+    """
+    Read-only detector for .pptx files. It DOES NOT modify the presentation.
+    It reports shapes/pictures/links that match a target domain and pictures
+    located in the bottom-right corner when any of them link to that domain.
+    """
+
+    def __init__(self, target_domain="gamma.app", corner_threshold=0.7):
+        self.target_domain = (target_domain or "").lower()
+        self.corner_threshold = corner_threshold
+
+    def identify_watermarks(self, pptx_path):
+        if Presentation is None:
+            return [], "python-pptx is not installed. Run: pip install python-pptx"
+        try:
+            prs = Presentation(pptx_path)
+        except Exception as e:
+            return [], f"Error opening PPTX: {e}"
+
+        results = []
+        print(f"\nScanning PPTX for domain: {self.target_domain}\n")
+
+        # Helpers to scan any shape collection (masters/layouts/slides)
+        def _scan_shape_tree(shapes, ctx, slide_index=None):
+            sw = sh = 0.0
+            if slide_index is not None:
+                # slide context
+                sw, sh = _pptx_slide_size(prs.slides[slide_index])
+            right_edge = sw * self.corner_threshold
+            bottom_edge = sh * self.corner_threshold
+
+            # First pass: gather corner pictures and note if any has target link
+            corner_shapes = []
+            corner_has_target = False
+
+            for shp in shapes:
+                # picture corner heuristic only for actual slides
+                if slide_index is not None and shp.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    if _pptx_is_in_corner(shp, right_edge, bottom_edge):
+                        corner_shapes.append(shp)
+                        url = _pptx_shape_hyperlink_url(shp)
+                        if url and self.target_domain in url.lower():
+                            corner_has_target = True
+
+            # Report corner pictures when any links to target
+            if corner_shapes and corner_has_target:
+                for shp in corner_shapes:
+                    results.append({
+                        'context': ctx,
+                        'slide': slide_index + 1 if slide_index is not None else None,
+                        'type': 'corner_picture',
+                        'name': getattr(shp, 'name', ''),
+                        'position': {'left': float(shp.left), 'top': float(shp.top), 'width': float(shp.width), 'height': float(shp.height)},
+                        'url': _pptx_shape_hyperlink_url(shp) or ''
+                    })
+                    print(f"  ✓ [{ctx}] slide {slide_index + 1 if slide_index is not None else '-'} corner picture flagged")
+
+            # Second pass: report any shapes with direct hyperlink to target domain
+            for shp in shapes:
+                url = _pptx_shape_hyperlink_url(shp)
+                if url and self.target_domain in url.lower():
+                    results.append({
+                        'context': ctx,
+                        'slide': slide_index + 1 if slide_index is not None else None,
+                        'type': 'shape_with_link',
+                        'name': getattr(shp, 'name', ''),
+                        'url': url
+                    })
+                    print(f"  ✓ [{ctx}] shape with target link: {url}")
+
+                # text run links
+                for pi, ri, rurl in _pptx_iter_text_run_links(shp):
+                    if rurl and self.target_domain in rurl.lower():
+                        results.append({
+                            'context': ctx,
+                            'slide': slide_index + 1 if slide_index is not None else None,
+                            'type': 'text_run_link',
+                            'name': getattr(shp, 'name', ''),
+                            'paragraph': pi,
+                            'run': ri,
+                            'url': rurl
+                        })
+                        print(f"  ✓ [{ctx}] text run link -> {rurl}")
+
+        # Masters
+        for m in prs.masters:
+            _scan_shape_tree(m.shapes, ctx="MASTER")
+
+        # Layouts
+        for layout in prs.slide_layouts:
+            _scan_shape_tree(layout.shapes, ctx="LAYOUT")
+
+        # Slides
+        for idx, slide in enumerate(prs.slides):
+            print(f"Slide {idx+1}:")
+            _scan_shape_tree(slide.shapes, ctx="SLIDE", slide_index=idx)
+
+        if not results:
+            print("No target-domain watermarks or links detected in PPTX.")
+        return results, None
+
+
+# Convenience router: pick detector by file extension
+import os
+
+def detect_watermarks(file_path, target_domain="gamma.app"):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == '.pdf':
+        detector = WatermarkDetector(target_domain=target_domain)
+        return detector.identify_watermarks(file_path)
+    elif ext == '.pptx':
+        detector = PPTXWatermarkDetector(target_domain=target_domain)
+        return detector.identify_watermarks(file_path)
+    else:
+        return [], f"Unsupported file type: {ext}. Use .pdf or .pptx"
