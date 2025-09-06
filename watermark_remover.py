@@ -1,148 +1,195 @@
-import fitz
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.oxml.xmlchemy import OxmlElement
+from pptx.util import Inches, Pt
+import os
 
-class WatermarkRemover:
-    def __init__(self, target_domain="gamma.app"):
-        self.target_domain = target_domain
+class PPTXWatermarkRemover:
+    def __init__(self, target_domain="gamma.app", corner_threshold=0.7):
+        """
+        target_domain: string contained in hyperlinks to remove (case-insensitive)
+        corner_threshold: fraction of slide width/height defining 'bottom-right corner'
+        """
+        self.target_domain = target_domain.lower()
+        self.corner_threshold = corner_threshold
 
-    def clean_pdf_from_target_domain(self, pdf_path, output_path):
-        """Cleans PDF from target domain elements"""
+        self.links_removed = 0
+        self.shapes_removed = 0
+        self.corner_images_removed = 0
 
-        pdf_document = fitz.open(pdf_path)
+    # ---------- Public API ----------
+    def clean_pptx_from_target_domain(self, pptx_path, output_path):
+        prs = Presentation(pptx_path)
 
-        print(f"Processing file: {pdf_path}")
+        print(f"Processing file: {pptx_path}")
         print(f"Target domain: {self.target_domain}")
-        print(f"Number of pages: {len(pdf_document)}")
+        print(f"Slides: {len(prs.slides)}")
 
-        total_images_removed = 0
-        total_links_removed = 0
+        # Masters and layouts first (watermarks often live there)
+        try:
+            for master in prs.part.slide_masters:
+                self._process_shape_tree(master, context="MASTER")
+        except Exception as e:
+            print(f"! Could not process masters: {e}")
 
-        for page_num in range(len(pdf_document)):
-            page = pdf_document[page_num]
-            print(f"\nPage {page_num + 1}:")
+        for layout in prs.slide_layouts:
+            self._process_shape_tree(layout, context="LAYOUT")
 
-            # 1. Remove images in bottom right corner with target links
-            images_removed = self._remove_corner_images_with_links(page, self.target_domain)
-            total_images_removed += images_removed
+        # Then actual slides
+        for i, slide in enumerate(prs.slides, start=1):
+            print(f"\nSlide {i}:")
+            self._process_slide(slide)
 
-            # 2. Remove all links to target domain
-            links_removed = self._remove_all_target_links(page, self.target_domain)
-            total_links_removed += links_removed
+        prs.save(output_path)
 
-            if not (images_removed or links_removed):
-                print("    No target elements found")
-
-        # Save result
-        pdf_document.save(output_path)
-        pdf_document.close()
-
-        print(f"\n{'='*60}")
-        print(f"RESULT:")
-        print(f"Links removed: {total_links_removed}")
-        print(f"Images removed: {total_images_removed}")
+        print("\n" + "="*60)
+        print("RESULT")
+        print(f"Links removed: {self.links_removed}")
+        print(f"Shapes removed (incl. pictures): {self.shapes_removed}")
+        print(f"Corner pictures removed: {self.corner_images_removed}")
         print(f"Cleaned file: {output_path}")
 
-        return total_images_removed, total_links_removed
+        return self.shapes_removed, self.links_removed, self.corner_images_removed
 
-    def _has_target_link(self, obj_rect, page, target_domain):
-        """Checks if an object has a link to the target domain"""
-        for link in page.get_links():
-            link_rect = fitz.Rect(link['from'])
-            uri = link.get('uri', '').lower()
-            if obj_rect.intersects(link_rect) and target_domain in uri:
-                return True, link.get('uri', '')
-        return False, ""
+    # ---------- Internals ----------
+    def _process_slide(self, slide):
+        sw, sh = self._slide_size(slide)
+        right_edge = sw * self.corner_threshold
+        bottom_edge = sh * self.corner_threshold
 
-    def _remove_all_target_links(self, page, target_domain):
-        """Removes all links to the target domain"""
-        removed_count = 0
-        links = page.get_links()
+        # 1) If any linked image in corner -> remove all corner pictures
+        corner_picture_ids_to_remove = set()
+        corner_has_target_link = False
 
-        for link in reversed(links):
-            uri = link.get('uri', '').lower()
-            if target_domain in uri:
-                page.delete_link(link)
-                removed_count += 1
-                print(f"    ✓ Link removed: {link.get('uri', '')}")
+        for shape in slide.shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE and self._is_in_corner(shape, right_edge, bottom_edge):
+                if self._shape_has_target_link(shape):
+                    corner_has_target_link = True
+                corner_picture_ids_to_remove.add(id(shape))
 
-        return removed_count
+        if corner_has_target_link:
+            removed = self._remove_shapes_by_id(slide, corner_picture_ids_to_remove)
+            self.corner_images_removed += removed
+            if removed:
+                print(f"  ✓ Removed {removed} corner picture(s) due to target-domain link")
 
-    def _remove_corner_images_with_links(self, page, target_domain, corner_threshold=0.7):
-        """Removes images in the bottom right corner with target links"""
-        page_rect = page.rect
-        right_threshold = page_rect.width * corner_threshold
-        bottom_threshold = page_rect.height * corner_threshold
+        # 2) Remove any shape/picture with hyperlink to target domain
+        # 3) Strip text run hyperlinks to target domain
+        # (Do second pass so we don’t mutate while we iterate corner set above)
+        # collect to remove
+        to_remove_ids = []
 
-        print(f"    Page size: {page_rect.width:.0f}x{page_rect.height:.0f}")
-        print(f"    Right edge threshold: {right_threshold:.0f}, bottom edge threshold: {bottom_threshold:.0f}")
+        for shape in list(slide.shapes):
+            # already removed in step 1
+            if id(shape) not in [id(s) for s in slide.shapes]:
+                continue
 
-        removed_count = 0
-        image_list = page.get_images(full=True)
-        target_images = []
-        images_to_remove = set()
+            if self._shape_has_target_link(shape):
+                to_remove_ids.append(id(shape))
+                continue
 
-        print(f"    Total images on page: {len(image_list)}")
+            # text runs: remove hyperlink or the run if it is only a link
+            if hasattr(shape, "text_frame") and shape.text_frame is not None:
+                changed = self._strip_text_run_links(shape)
+                if changed:
+                    print(f"  ✓ Stripped {changed} hyperlink(s) from text")
+                    self.links_removed += changed
 
-        # Find all images in corner with target links
-        for img in image_list:
-            xref = img[0]
-            img_rects = page.get_image_rects(xref)
+        removed = self._remove_shapes_by_id(slide, to_remove_ids)
+        self.shapes_removed += removed
+        if removed:
+            print(f"  ✓ Removed {removed} shape(s) with target-domain link")
 
-            for img_rect in img_rects:
-                print(f"    Image xref:{xref} position: ({img_rect.x0:.0f}, {img_rect.y0:.0f}) size: {img_rect.width:.0f}x{img_rect.height:.0f}")
-
-                is_in_corner = (img_rect.x0 >= right_threshold and img_rect.y0 >= bottom_threshold)
-                print(f"      In corner: {is_in_corner} (x0={img_rect.x0:.0f}>={right_threshold:.0f}, y0={img_rect.y0:.0f}>={bottom_threshold:.0f})")
-
-                if is_in_corner:
-                    has_link, url = self._has_target_link(img_rect, page, target_domain)
-                    print(f"      Has target link: {has_link} ({url})")
-                    if has_link:
-                        target_images.append((xref, img_rect, url))
-                        images_to_remove.add(xref)
-
-        # If we found images with target links in corner - remove ALL images in that corner
-        if target_images:
-            print(f"    Found {len(target_images)} images with target links in corner")
-
-            # Collect all images in corner (even without links)
-            for img in image_list:
-                xref = img[0]
-                img_rects = page.get_image_rects(xref)
-
-                for img_rect in img_rects:
-                    is_in_corner = (img_rect.x0 >= right_threshold and img_rect.y0 >= bottom_threshold)
-                    if is_in_corner:
-                        images_to_remove.add(xref)
-                        print(f"      Added for removal image xref:{xref} (in corner)")
-
-            print(f"    Total to remove: {len(images_to_remove)} images")
-
-            # Remove images
-            for xref in images_to_remove:
-                try:
-                    # Get sizes to determine type
-                    img_rects = page.get_image_rects(xref)
-                    img_type = "logo" if any(r.height < 50 for r in img_rects) else "element"
-                    sizes = [f"{r.width:.0f}x{r.height:.0f}" for r in img_rects]
-
-                    page.delete_image(xref)
-                    removed_count += 1
-                    print(f"    ✓ Removed image ({img_type}) xref:{xref}: {', '.join(sizes)}")
-                except Exception as e:
-                    print(f"    ✗ Error removing image xref:{xref}: {e}")
-        else:
-            print(f"    No images with target links found in corner")
-
-        return removed_count
-
-    def remove_watermarks(self, pdf_path, images_to_remove_info, output_pdf_path="output_without_watermarks.pdf"):
-        """Compatibility with old API - uses new algorithm"""
+    def _process_shape_tree(self, obj_with_shapes, context=""):
+        # masters/layouts
         try:
-            images_removed, links_removed = self.clean_pdf_from_target_domain(pdf_path, output_pdf_path)
+            for shape in list(obj_with_shapes.shapes):
+                # remove shapes with direct hyperlink
+                if self._shape_has_target_link(shape):
+                    obj_with_shapes.shapes._spTree.remove(shape._element)
+                    self.shapes_removed += 1
+                    print(f"  ✓ [{context}] Removed shape with target-domain link")
+                    continue
 
-            print(f"\nNew PDF without watermarks saved as: {output_pdf_path}")
-            print(f"Total elements removed: {images_removed + links_removed}")
-            return output_pdf_path, None
-
+                # strip text links inside masters/layouts
+                if hasattr(shape, "text_frame") and shape.text_frame is not None:
+                    changed = self._strip_text_run_links(shape)
+                    if changed:
+                        print(f"  ✓ [{context}] Stripped {changed} hyperlink(s) from text")
+                        self.links_removed += changed
         except Exception as e:
-            return None, f"Error removing watermarks and saving PDF: {str(e)}"
+            print(f"  ! [{context}] Error processing shapes: {e}")
+
+    def _remove_shapes_by_id(self, slide, ids_set):
+        removed = 0
+        for shape in list(slide.shapes):
+            if id(shape) in ids_set:
+                slide.shapes._spTree.remove(shape._element)
+                removed += 1
+        return removed
+
+    def _shape_has_target_link(self, shape):
+        try:
+            # picture or auto-shape click hyperlink
+            if hasattr(shape, "click_action") and shape.click_action is not None:
+                h = shape.click_action.hyperlink
+                if h is not None and h.address:
+                    if self.target_domain in h.address.lower():
+                        self.links_removed += 1  # count link removed with shape
+                        return True
+
+            # text-frame link on the whole shape (rare, but possible)
+            if hasattr(shape, "text_frame") and shape.text_frame is not None:
+                for p in shape.text_frame.paragraphs:
+                    for r in p.runs:
+                        if r.hyperlink and r.hyperlink.address:
+                            if self.target_domain in r.hyperlink.address.lower():
+                                # we’ll remove link at run-level instead of whole shape
+                                # but for “shape_has_target_link” we leave False
+                                pass
+        except Exception:
+            pass
+        return False
+
+    def _strip_text_run_links(self, shape):
+        """Remove hyperlinks from text runs that point to target domain.
+           Returns the number of links stripped.
+        """
+        removed = 0
+        tf = shape.text_frame
+        for p in tf.paragraphs:
+            for r in p.runs:
+                try:
+                    if r.hyperlink and r.hyperlink.address and self.target_domain in r.hyperlink.address.lower():
+                        # Clear the hyperlink (python-pptx: setting address to None detaches it)
+                        r.hyperlink.address = None
+                        removed += 1
+                        # Optionally, remove the run if it was pure link text with no value after strip
+                        if r.text.strip() == "":
+                            r._r.getparent().remove(r._r)
+                except Exception:
+                    continue
+        return removed
+
+    def _slide_size(self, slide):
+        # slide width/height from presentation object
+        # pptx stores sizes at presentation level; fetch via slide.part
+        prs = slide.part.package.presentation_part.presentation
+        return float(prs.slide_width), float(prs.slide_height)
+
+    def _is_in_corner(self, shape, right_edge, bottom_edge):
+        try:
+            # left/top/width/height are EMUs
+            left = float(shape.left)
+            top = float(shape.top)
+            return (left >= right_edge) and (top >= bottom_edge)
+        except Exception:
+            return False
+
+
+if __name__ == "__main__":
+    # Example usage
+    inp = "input.pptx"
+    out = "cleaned_without_gamma_links.pptx"
+    remover = PPTXWatermarkRemover(target_domain="gamma.app", corner_threshold=0.7)
+    shapes_removed, links_removed, corner_removed = remover.clean_pptx_from_target_domain(inp, out)
